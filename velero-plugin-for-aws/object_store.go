@@ -17,8 +17,10 @@ limitations under the License.
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"sort"
 	"strconv"
@@ -50,6 +52,7 @@ const (
 	serverSideEncryptionKey  = "serverSideEncryption"
 	insecureSkipTLSVerifyKey = "insecureSkipTLSVerify"
 	caCertKey                = "caCert"
+	encryptionSecret         = "encryptionSecret"
 )
 
 type s3Interface interface {
@@ -68,6 +71,7 @@ type ObjectStore struct {
 	kmsKeyID             string
 	signatureVersion     string
 	serverSideEncryption string
+	encryptionSecret     string
 }
 
 func newObjectStore(logger logrus.FieldLogger) *ObjectStore {
@@ -93,6 +97,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 		credentialProfileKey,
 		serverSideEncryptionKey,
 		insecureSkipTLSVerifyKey,
+		encryptionSecret,
 	); err != nil {
 		return err
 	}
@@ -107,6 +112,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 		credentialProfile        = config[credentialProfileKey]
 		serverSideEncryption     = config[serverSideEncryptionKey]
 		insecureSkipTLSVerifyVal = config[insecureSkipTLSVerifyKey]
+		encryptionSecret         = config[encryptionSecret]
 
 		// note that bucket is automatically added to the config map
 		// by the server from the ObjectStorageProviderConfig so
@@ -179,6 +185,7 @@ func (o *ObjectStore) Init(config map[string]string) error {
 	o.s3Uploader = s3manager.NewUploader(serverSession)
 	o.kmsKeyID = kmsKeyID
 	o.serverSideEncryption = serverSideEncryption
+	o.encryptionSecret = encryptionSecret
 
 	if signatureVersion != "" {
 		if !isValidSignatureVersion(signatureVersion) {
@@ -235,6 +242,18 @@ func newAWSConfig(url, region string, forcePathStyle bool) (*aws.Config, error) 
 }
 
 func (o *ObjectStore) PutObject(bucket, key string, body io.Reader) error {
+	if o.encryptionSecret != "" {
+		// encrypt body
+		buf := new(strings.Builder)
+		_, err := io.Copy(buf, body)
+		if err != nil {
+			return err
+		}
+		// check errors
+		encryptedStr := encrypt(buf.String(), o.encryptionSecret)
+		body = strings.NewReader(encryptedStr)
+	}
+
 	req := &s3manager.UploadInput{
 		Bucket: &bucket,
 		Key:    &key,
@@ -308,6 +327,16 @@ func (o *ObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
 	res, err := o.s3.GetObject(req)
 	if err != nil {
 		return nil, errors.Wrapf(err, "error getting object %s", key)
+	}
+
+	if o.encryptionSecret != "" {
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(res.Body)
+		encryptedStr := buf.String()
+		decryptedStr := decrypt(encryptedStr, o.encryptionSecret)
+		r := ioutil.NopCloser(strings.NewReader(decryptedStr))
+		return r, nil
+
 	}
 
 	return res.Body, nil
